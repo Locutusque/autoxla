@@ -1,0 +1,14 @@
+transformers
+zstandard
+jsonlines
+peft
+wandb
+bitsandbytes
+accelerate
+datasets
+sentencepiece
+langchain
+torch~=2.8.0
+torch_xla[tpu]~=2.8.0 --find-links=https://storage.googleapis.com/libtpu-releases/index.html --find-links=https://storage.googleapis.com/libtpu-wheels/index.html
+torch_xla[pallas] --find-links=https://storage.googleapis.com/jax-releases/jax_nightly_releases.html --find-links=https://storage.googleapis.com/jax-releases/jaxlib_nightly_releases.html
+tensorflow-cpu

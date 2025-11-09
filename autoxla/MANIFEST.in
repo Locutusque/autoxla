@@ -1,0 +1,5 @@
+include README.md
+recursive-include AutoXLA/models *
+recursive-include AutoXLA/optim *
+recursive-include AutoXLA/quantization *
+recursive-include AutoXLA/kernels *
