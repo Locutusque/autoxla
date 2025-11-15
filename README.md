@@ -45,7 +45,7 @@ Ensure a TPU runtime is available before installation.
 
 Installing from source ensures all TPU-specific dependencies, including PyTorch/XLA with the correct build links, are properly configured:
 ```bash
-git clone https://github.com/Locutusque/AutoXLA.git
+git clone https://github.com/Locutusque/autoxla.git
 cd AutoXLA
 pip install -r requirements.txt
 pip install -e .
@@ -174,5 +174,6 @@ Credits go to IsNoobGrammer, vLLM, and torchprime for some of the kernels.
 
 Research supported with Cloud TPUs from Google's TPU Research Cloud (TRC)
 ---
+
 
 
