@@ -280,6 +280,12 @@ class AutoXLAModelForCausalLM(object):
             return model
         
         attn_impl = attn_implementation.lower()
+
+        config = model.config
+
+        if hasattr(config, "attn_logit_softcapping"):
+            xm.master_print("> Attention logit softcapping detected. Taking softcap values from config")
+            attn_logit_softcapping = config.attn_logit_softcapping
         
         if attn_impl == "xla_flash_attention":
             if verbose and xm.is_master_ordinal():
@@ -299,7 +305,8 @@ class AutoXLAModelForCausalLM(object):
             patcher = XLAFlashAttentionPatcher(
                 mesh=mesh,
                 partition_spec=partition_spec,
-                layer_indices=layer_indices
+                layer_indices=layer_indices,
+                logits_soft_cap=attn_logit_softcapping
             )
             model = patcher.patch_model(model, inplace=True)
             
@@ -320,7 +327,8 @@ class AutoXLAModelForCausalLM(object):
             
             patcher = SplashAttentionPatcher(
                 splash_config=splash_config,
-                layer_indices=layer_indices
+                layer_indices=layer_indices,
+                logits_soft_cap=attn_logit_softcapping
             )
             model = patcher.patch_model(model, inplace=True)
             
