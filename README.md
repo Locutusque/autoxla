@@ -70,6 +70,19 @@ Below is a minimal example using `AutoXLAModelForCausalLM` to load and shard a H
 ```python
 from AutoXLA.modeling import AutoXLAModelForCausalLM
 
+# Create block sizes
+sa_blocks = {
+    "sa_block_q": 512,
+    "sa_block_kv": 512,
+    "sa_block_kv_compute": 512,
+    "sa_block_q_dkv": 512,
+    "sa_block_kv_dkv": 512,
+    "sa_block_kv_dkv_compute": 512,
+    "sa_block_q_dq": 512,
+    "sa_block_kv_dq": 512,
+    "mesh": str(mesh)
+}
+
 # Load a pretrained model with FSDP sharding and XLA Flash Attention
 model = AutoXLAModelForCausalLM.from_pretrained(
     "meta-llama/Llama-2-7b-hf",
@@ -88,7 +101,7 @@ model = AutoXLAModelForCausalLM.from_pretrained(
 model = AutoXLAModelForCausalLM.from_pretrained(
     "meta-llama/Llama-2-7b-hf",
     attn_implementation="splash_attention",
-    attention_config={"sa_block_q": 1024, ...}
+    attention_config=sa_blocks,
 )
 ```
 
@@ -174,6 +187,7 @@ Credits go to IsNoobGrammer, vLLM, and torchprime for some of the kernels.
 
 Research supported with Cloud TPUs from Google's TPU Research Cloud (TRC)
 ---
+
 
 
 
