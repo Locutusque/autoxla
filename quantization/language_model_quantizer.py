@@ -41,6 +41,8 @@ try:
         from ..kernels.quantization.quantized_matmul import (
             quantized_matmul_kernel,
             get_tuned_block_sizes,
+        )
+        from ..kernels.quantization.tuned_block_sizes import (
             TUNED_BLOCK_SIZES,
             get_tpu_version
         )
