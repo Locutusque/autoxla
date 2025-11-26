@@ -223,7 +223,6 @@ class SplashAttentionPatcher(BaseAttentionPatcher):
             original_attention=original_attention,
             config=self.splash_config,
             logits_soft_cap=self.logits_soft_cap,
-            rotatry_func=rotary_func,
         )
     
     def _get_wrapper_name(self) -> str:
