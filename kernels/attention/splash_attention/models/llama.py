@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch
 from ..sa_kernel import SplashAttentionConfig, splash_attention
 from typing import Optional, Unpack
-from transformers.models.llama import apply_rotary_pos_emb
+from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
 class LlamaSplashAttention(_BaseSplashAttentionWrapper):
     def __init__(
@@ -69,5 +69,6 @@ class LlamaSplashAttention(_BaseSplashAttentionWrapper):
         # Reshape output and apply output projection
         attn_output = attn_output.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         attn_output = self.original_attention.o_proj(attn_output)
+
 
         return attn_output, None
