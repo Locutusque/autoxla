@@ -14,11 +14,14 @@ class Qwen3SplashAttention(_BaseSplashAttentionWrapper):
             logits_soft_cap: Optional[float] = None,
     ):
         super().__init__(
+            self
             original_attention=original_attention,
             config=config,
             logits_soft_cap=logits_soft_cap,
             rotatry_func=apply_rotary_pos_emb,
         )
+        self.q_norm = original_attention.q_norm
+        self.k_norm = original_attention.k_norm
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -60,4 +63,5 @@ class Qwen3SplashAttention(_BaseSplashAttentionWrapper):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
+
         return attn_output, None
