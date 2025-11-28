@@ -14,7 +14,7 @@ class Qwen3SplashAttention(_BaseSplashAttentionWrapper):
             logits_soft_cap: Optional[float] = None,
     ):
         super().__init__(
-            self
+            self,
             original_attention=original_attention,
             config=config,
             logits_soft_cap=logits_soft_cap,
@@ -65,3 +65,4 @@ class Qwen3SplashAttention(_BaseSplashAttentionWrapper):
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None
+
