@@ -29,10 +29,12 @@ class _BaseSplashAttentionWrapper(nn.Module):
         super().__init__()
         self.original_attention = original_attention
         self.config = config
-
+        if hasattr(original_attention, "num_key_value_groups"):
+            self.num_key_value_groups = original_attention.num_key_value_groups
         # Extract attributes from original attention
         self.num_heads = original_attention.config.num_attention_heads
         self.num_kv_heads = original_attention.config.num_key_value_heads
+        self.num_
         self.head_dim = original_attention.head_dim
         self.scaling = original_attention.scaling
         self.layer_idx = original_attention.layer_idx
