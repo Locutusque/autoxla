@@ -63,5 +63,5 @@ class Ministral3SplashAttention(_BaseSplashAttentionWrapper):
         )
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.original_attention.o_proj(attn_output)
         return attn_output, None
