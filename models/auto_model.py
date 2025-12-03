@@ -1,7 +1,7 @@
 import os
 from typing import Optional, Union, Callable
 from functools import partial
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoConfig, AutoModelForImageTextToText
 from transformers.models.auto.auto_factory import _BaseAutoModelClass, _LazyAutoMapping
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES
@@ -439,13 +439,26 @@ class AutoXLAModelForCausalLM(object):
             if verbose:
                 xm.master_print("> No partition spec for the attention was supplied. Setting it automatically.")
             attention_partition_spec = ("fsdp", "mp")
+
+        config = AutoConfig.from_pretrained(
+            pretrained_model_name_or_path
+        )
         # Always load with eager attention first, we'll patch it later
-        model = AutoModelForCausalLM.from_pretrained(
+        if hasattr(config, "vision_config"):
+            model = AutoModelForImageTextToText.from_pretrained(
             pretrained_model_name_or_path, 
             attn_implementation="eager", 
             *model_args, 
             **kwargs
-        )  
+        )
+        else:
+
+            model = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path, 
+                attn_implementation="eager", 
+                *model_args, 
+                **kwargs
+            )  
         model = apply_xla_patch_to_nn_linear(model, xs.xla_patched_nn_linear_forward)
         model._set_gradient_checkpointing(enable=gradient_checkpointing, gradient_checkpointing_func=checkpoint)
         # Apply quantization if requested
