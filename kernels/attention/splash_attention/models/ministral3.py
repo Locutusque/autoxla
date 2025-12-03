@@ -27,9 +27,9 @@ class Ministral3SplashAttention(_BaseSplashAttentionWrapper):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor],
-        past_key_values: Optional[Cache] = None,
+        past_key_values = None,
         cache_position: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[FlashAttentionKwargs],
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
@@ -42,8 +42,8 @@ class Ministral3SplashAttention(_BaseSplashAttentionWrapper):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         query_states = query_states * _get_llama_4_attn_scale(
             cache_position,
-            self.config.rope_parameters.get("llama_4_scaling_beta"),
-            self.config.rope_parameters.get("original_max_position_embeddings"),
+            self.original_attention.config.rope_parameters.get("llama_4_scaling_beta"),
+            self.original_attention.config.rope_parameters.get("original_max_position_embeddings"),
         ).to(query_states.dtype)
 
         if past_key_values is not None:
