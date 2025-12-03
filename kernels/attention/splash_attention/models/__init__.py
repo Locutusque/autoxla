@@ -15,5 +15,11 @@ ATTN_CLASSES = {
 }
 
 def _get_attention_class_from_model(model: PreTrainedModel):
-    attn_class = ATTN_CLASSES.get(model.config.model_type, _BaseSplashAttentionWrapper)
+    if hasattr(model.config, "vision_config"):
+        model_type = model.config.text_config.model_type
+        if model_type == "mistral":
+            model_type = "ministral3"
+    else:
+        model_type = model.config.model_type
+    attn_class = ATTN_CLASSES.get(model_type, _BaseSplashAttentionWrapper)
     return attn_class
