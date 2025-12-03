@@ -60,7 +60,10 @@ class BaseAttentionPatcher(ABC):
     def _get_attention_layers(self, model: PreTrainedModel, model_type: str):
         """Get all attention layer modules from the model."""
         attention_pattern = self.ATTENTION_LAYER_MAPPING.get(model_type, "model.layers.{}.self_attn")
-        num_layers = model.config.num_hidden_layers
+        if model_type == "mistral3":
+            num_layers = model.config.text_config.num_hidden_layers
+        else:
+            num_layers = model.config.num_hidden_layers
         
         attention_layers = []
         for layer_idx in range(num_layers):
