@@ -9,7 +9,8 @@ ATTN_CLASSES = {
     "llama": LlamaSplashAttention,
     "gemma2": Gemma2SplashAttention,
     "qwen3": Qwen3SplashAttention,
-    "mistral": MistralSplashAttention
+    "mistral": MistralSplashAttention,
+    "mistral3": MistralSplashAttention
 }
 
 def _get_attention_class_from_model(model: PreTrainedModel):
