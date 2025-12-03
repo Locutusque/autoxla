@@ -20,6 +20,7 @@ class BaseAttentionPatcher(ABC):
     ATTENTION_LAYER_MAPPING = {
         "llama": "model.layers.{}.self_attn",
         "mistral": "model.layers.{}.self_attn",
+        "mistral3": "model.language_model.layers.{}.self_attn",
         "qwen2": "model.layers.{}.self_attn",
         "gemma": "model.layers.{}.self_attn",
         "gemma2": "model.layers.{}.self_attn",
@@ -86,7 +87,7 @@ class BaseAttentionPatcher(ABC):
         try:
             if model_type == "llama":
                 from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
-            elif model_type == "mistral":
+            elif model_type == "mistral" or model_type == "mistral3":
                 from transformers.models.mistral.modeling_mistral import apply_rotary_pos_emb
             elif model_type == "qwen2":
                 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
