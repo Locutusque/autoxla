@@ -11,6 +11,17 @@ import jax
 
 logger = logging.getLogger(__name__)
 
+_WARNED_ONCE: set = set()
+
+
+def _warn_once(msg: str, *args):
+    """Log a warning only once per unique (msg, args); the stdlib logger has
+    no `warning_once` (that is a vLLM extension)."""
+    key = (msg, args)
+    if key not in _WARNED_ONCE:
+        _WARNED_ONCE.add(key)
+        logger.warning(msg, *args)
+
 
 class TunedKey(NamedTuple):
     tpu_version: int
@@ -539,7 +550,7 @@ DEVICE_VMEM_LIMIT = {6: 96 * 1024 * 1024, 7: 48 * 1024 * 1024}
 def get_device_vmem_limit() -> int:
     tpu_version = get_tpu_version()
     if tpu_version not in DEVICE_VMEM_LIMIT:
-        logger.warning_once(
+        _warn_once(
             'VMEM limit for TPU version %d not found. Using default VMEM limit '
             'of 96MiB', tpu_version)
         return 96 * 1024 * 1024
@@ -602,7 +613,7 @@ def get_tuned_block_sizes(
     )
     tuned_value = TUNED_BLOCK_SIZES.get(key)
     if tuned_value is None:
-        logger.warning_once(
+        _warn_once(
             'Couldn`t find tuned sizes for the quantized matmul kernel with %s',
             key)
         return TunedValue(128, 128, 128)

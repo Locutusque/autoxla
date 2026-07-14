@@ -1,11 +1,23 @@
 """
-Language Model Quantizer for torch_xla
-Provides utilities for quantizing language models using XLA-optimized operations.
+Model Quantizer for torch_xla
+Provides utilities for quantizing models (language models, vision transformers,
+image segmentation models such as SAM/SAM2/SAM3) using XLA-optimized operations.
 Supports packing 4-bit quantized weights into int8 for memory efficiency.
+
+Three quantized-matmul backends are wired, in order of preference:
+  1. The Pallas TPU kernel (``kernels/quantization/quantized_matmul.py``),
+     used when ``QuantizationConfig.use_pallas`` is set and supported
+     (per-channel, symmetric).
+  2. torch_xla's fused XLA kernel (``torch.ops.xla.quantized_matmul``),
+     used on XLA devices for per-channel symmetric quantization.
+  3. A pure-torch dequantize+matmul fallback that works everywhere and
+     supports blockwise and asymmetric quantization.
 """
 
+import functools
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Union, Tuple, Dict, List, Callable
 import logging
 
@@ -23,40 +35,51 @@ except ImportError:
 JAX_AVAILABLE = False
 PALLAS_KERNELS_AVAILABLE = False
 quantized_matmul_kernel = None
+quantized_matmul_pallas_call = None
 get_tuned_block_sizes = None
 TUNED_BLOCK_SIZES = None
+TunedValue = None
+next_multiple = None
 
 try:
     from torch_xla.experimental.custom_kernel import jax_import_guard
     jax_import_guard()
-    
+
     import jax
     import jax.numpy as jnp
     from torch_xla.experimental.custom_kernel import make_kernel_from_pallas
-    
+
     JAX_AVAILABLE = True
-    
+
     # Try to import the pre-built Pallas quantized matmul kernels
     try:
         from ..kernels.quantization.quantized_matmul import (
             quantized_matmul_kernel,
-            get_tuned_block_sizes,
+            quantized_matmul_pallas_call,
         )
         from ..kernels.quantization.tuned_block_sizes import (
             TUNED_BLOCK_SIZES,
-            get_tpu_version
+            TunedValue,
+            get_tpu_version,
+            get_tuned_block_sizes,
         )
+        from ..kernels.quantization.util import next_multiple
         PALLAS_KERNELS_AVAILABLE = True
         logging.info("Pallas quantized matmul kernels available")
     except ImportError as e:
         logging.info(f"Pallas quantized matmul kernels not available: {e}")
-        
+
 except ImportError as e:
     JAX_AVAILABLE = False
-    logging.info(f"Jax not available. Will use torch/eager kernels instead of Pallas. {f}")
+    logging.info(f"Jax not available. Will use torch/eager kernels instead of Pallas. {e}")
 
 
 logger = logging.getLogger(__name__)
+
+
+def _torch_dtype_name(dtype: torch.dtype) -> str:
+    """'torch.bfloat16' -> 'bfloat16', matching the tuned-table dtype keys."""
+    return str(dtype).replace("torch.", "")
 
 
 class QuantizationConfig:
@@ -74,6 +97,9 @@ class QuantizationConfig:
         quantize_lm_head: bool = False,
         auto_tune_block_sizes: bool = True,
         pack_4bit: bool = True,
+        use_xla_kernel: bool = True,
+        exclude_layers: Optional[List[str]] = None,
+        bits: Optional[int] = None,
     ):
         """
         Args:
@@ -86,8 +112,15 @@ class QuantizationConfig:
             quantize_embeddings: Whether to quantize embedding layers. Not recommended
             quantize_lm_head: Whether to quantize the language model head. Not recommended
             auto_tune_block_sizes: Use pre-tuned block sizes for optimal performance
-            pack_4bit: Pack 4-bit values into int32 (8 values per int32)
+            pack_4bit: Pack 4-bit values into int8 (2 values per int8)
+            use_xla_kernel: Use torch_xla's fused torch.ops.xla.quantized_matmul
+                kernel on XLA devices when the Pallas path is not taken
+            exclude_layers: Extra name substrings; matching layers are never
+                quantized (e.g. ["iou_prediction_head", "output_upscaling"])
+            bits: Alias for n_bits (takes precedence when provided)
         """
+        if bits is not None:
+            n_bits = bits
         assert n_bits in [4, 8], "Only 4-bit and 8-bit quantization supported"
         self.n_bits = n_bits
         self.block_size = block_size
@@ -99,7 +132,9 @@ class QuantizationConfig:
         self.quantize_lm_head = quantize_lm_head
         self.auto_tune_block_sizes = auto_tune_block_sizes
         self.pack_4bit = pack_4bit and (n_bits == 4)
-        
+        self.use_xla_kernel = use_xla_kernel
+        self.exclude_layers = list(exclude_layers) if exclude_layers else []
+
         if use_pallas and not JAX_AVAILABLE:
             logger.warning("Pallas kernels requested but Jax not available. Using eager kernels.")
             self.use_pallas = False
@@ -233,43 +268,43 @@ def _quantize_per_channel(
     dims = list(range(weight.ndim))
     dims.remove(axis)
     
+    # Both symmetric and asymmetric quantization use the signed range so the
+    # values fit in the int8 storage buffer (and, for 4-bit, in the packed
+    # [-8, 7] representation). Dequantization is w = (q - zp) * scale, which
+    # is invariant to this choice of range.
+    qmax = 2 ** (n_bits - 1) - 1
+    qmin = -(2 ** (n_bits - 1))
+
     if symmetric:
         # Symmetric: use max absolute value
         max_val = torch.amax(torch.abs(weight), dim=dims, keepdim=True)
         min_val = -max_val
-        qmax = 2 ** (n_bits - 1) - 1
-        qmin = -(2 ** (n_bits - 1))
-        zero_point = None
     else:
         # Asymmetric: use actual min/max
         max_val = torch.amax(weight, dim=dims, keepdim=True)
         min_val = torch.amin(weight, dim=dims, keepdim=True)
-        qmax = 2 ** n_bits - 1
-        qmin = 0
-        
+
     # Calculate scale
     scale = (max_val - min_val) / (qmax - qmin)
     scale = torch.clamp(scale, min=1e-8)  # Avoid division by zero
-    
+
     if not symmetric:
-        # Calculate zero point for asymmetric quantization
+        # Calculate zero point for asymmetric quantization. Keep the keepdim
+        # shape until after the quantization step so it broadcasts against
+        # the quantization axis (not the reduced dims).
         zero_point = qmin - torch.round(min_val / scale)
-        zero_point = torch.clamp(zero_point, qmin, qmax).to(torch.int8)
-        zero_point = zero_point.squeeze()
+        zero_point = torch.clamp(zero_point, qmin, qmax)
+        q_weight = torch.round(weight / scale) + zero_point
+        zero_point = zero_point.reshape(weight.shape[axis]).to(torch.int8)
     else:
         zero_point = None
-    
-    # Quantize
-    if symmetric:
         q_weight = torch.round(weight / scale)
-    else:
-        q_weight = torch.round(weight / scale) + zero_point
-        
+
     q_weight = torch.clamp(q_weight, qmin, qmax).to(torch.int8)
-    
+
     # Reshape scale to 1D
-    scale = scale.squeeze()
-    
+    scale = scale.reshape(weight.shape[axis])
+
     return q_weight, scale, zero_point
 
 
@@ -291,9 +326,12 @@ def _quantize_blockwise(
     # Transpose to [num_blocks, block_size, out_features]
     weight_reshaped = weight_reshaped.permute(1, 2, 0)
     
+    # Signed range for both modes so values fit int8 storage and the packed
+    # 4-bit representation; see _quantize_per_channel.
+    qmax = 2 ** (n_bits - 1) - 1
+    qmin = -(2 ** (n_bits - 1))
+
     if symmetric:
-        qmax = 2 ** (n_bits - 1) - 1
-        qmin = -(2 ** (n_bits - 1))
         # Max per block per output channel: [num_blocks, 1, out_features]
         max_val = torch.amax(torch.abs(weight_reshaped), dim=1, keepdim=True)
         scale = max_val / qmax
@@ -301,16 +339,14 @@ def _quantize_blockwise(
         q_weight = torch.round(weight_reshaped / scale)
         zero_point = None
     else:
-        qmax = 2 ** n_bits - 1
-        qmin = 0
         max_val = torch.amax(weight_reshaped, dim=1, keepdim=True)
         min_val = torch.amin(weight_reshaped, dim=1, keepdim=True)
         scale = (max_val - min_val) / (qmax - qmin)
         scale = torch.clamp(scale, min=1e-8)
         zero_point = qmin - torch.round(min_val / scale)
-        zero_point = torch.clamp(zero_point, qmin, qmax).to(torch.int8)
-        zero_point = zero_point.squeeze(1)  # [num_blocks, out_features]
-        q_weight = torch.round(weight_reshaped / scale) + zero_point.unsqueeze(1)
+        zero_point = torch.clamp(zero_point, qmin, qmax)
+        q_weight = torch.round(weight_reshaped / scale) + zero_point
+        zero_point = zero_point.squeeze(1).to(torch.int8)  # [num_blocks, out_features]
     
     q_weight = torch.clamp(q_weight, qmin, qmax).to(torch.int8)
     scale = scale.squeeze(1)  # [num_blocks, out_features]
@@ -320,7 +356,12 @@ def _quantize_blockwise(
 
 class QuantizedLinear(nn.Module):
     """Quantized Linear layer wrapper with Pallas kernel support and 4-bit packing."""
-    
+
+    # Flipped to True the first time torch.ops.xla.quantized_matmul fails, so
+    # every layer permanently falls back to the manual path instead of
+    # re-raising on each forward.
+    _xla_kernel_failed = False
+
     def __init__(
         self,
         original_layer: nn.Linear,
@@ -330,73 +371,33 @@ class QuantizedLinear(nn.Module):
         self.in_features = original_layer.in_features
         self.out_features = original_layer.out_features
         self.config = config
-        
+
         # Store original shape for 4-bit packed weights
         self.original_weight_shape = None
-        
-        # Determine block sizes for Pallas
-        self.batch_block_size = None
-        self.out_block_size = None
-        self.in_block_size = None
-        
-        # Setup Pallas kernels if requested
-        self.pallas_kernel = None
+
+        # Pallas kernel wrappers, keyed by TunedValue (block sizes depend on
+        # the flattened batch dimension, which can vary between forwards).
+        self._pallas_kernels = {}
+        self.use_pallas = False
         if config.use_pallas and PALLAS_KERNELS_AVAILABLE:
-            self._setup_pallas_kernel()
-        
+            if config.block_size != -1:
+                logger.warning(
+                    "Pallas quantized matmul only supports per-channel "
+                    "quantization; using the XLA/eager fallback for this layer.")
+            elif not config.symmetric:
+                logger.warning(
+                    "Pallas quantized matmul does not support asymmetric "
+                    "zero-points; using the XLA/eager fallback for this layer.")
+            else:
+                self.use_pallas = True
+
         # Quantize the weights - this will register buffers
         self._quantize_from_layer(original_layer)
-    
-    def _setup_pallas_kernel(self):
-        """Setup Pallas kernel wrapper for PyTorch."""
-        if self.config.block_size != -1:
-            logger.warning("Pallas kernels currently only support per-channel quantization. Using XLA fallback for blockwise.")
-            self.config.use_pallas = False
-            return
-        print("Setting up pallas kernels...")
-        # Define output shape function for the kernel wrapper
-        def output_shape_fn(x, w, scale, zero_point):
-            batch_size = x.shape[0]
-            out_features = w.shape[0]
-            return [(tuple([batch_size, out_features]), x.dtype)]
-        
-        # Wrap the Pallas kernel for PyTorch
-        self.pallas_kernel = make_kernel_from_pallas(
-            quantized_matmul_kernel,
-            output_shape_fn
-        )
-        logger.info("Initialized Pallas quantized matmul kernel")
-    
-    def _get_optimal_block_sizes(self, batch_size: int) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-        """Get optimal block sizes for the given configuration."""
-        if not self.config.auto_tune_block_sizes or not PALLAS_KERNELS_AVAILABLE:
-            # Use default block sizes
-            return 128, 128, 128
-        
-        # Get tuned block sizes from the lookup table
-        dtype_str = 'bfloat16'  # Assuming bfloat16, could be parameterized
-        block_sizes = get_tuned_block_sizes(
-            TUNED_BLOCK_SIZES,
-            batch_size,
-            self.out_features,
-            self.in_features,
-            dtype_str,
-            self.config.quantize_activation
-        )
-        
-        if block_sizes[0] is not None:
-            logger.debug(f"Using tuned block sizes for batch={batch_size}, "
-                        f"out={self.out_features}, in={self.in_features}: {block_sizes}")
-            return block_sizes
-        else:
-            # Fallback to reasonable defaults
-            logger.debug(f"No tuned block sizes found, using defaults")
-            return 128, 128, 128
-    
+
     def _quantize_from_layer(self, layer: nn.Linear):
         """Quantize weights from the original layer."""
         weight = layer.weight.data
-        
+
         q_weight, scale, zero_point, original_shape = quantize_weight(
             weight,
             n_bits=self.config.n_bits,
@@ -405,7 +406,7 @@ class QuantizedLinear(nn.Module):
             block_size=self.config.block_size,
             pack_4bit=self.config.pack_4bit
         )
-        
+
         # Register quantized weights and parameters as buffers
         self.register_buffer('q_weight', q_weight)
         self.register_buffer('scale', scale)
@@ -413,90 +414,178 @@ class QuantizedLinear(nn.Module):
             self.register_buffer('zero_point', zero_point)
         else:
             self.zero_point = None
-        
+
+        # Keep the bias in full precision. Vision transformers and
+        # segmentation models (SAM/SAM2/SAM3, ViT, DETR) use biases on nearly
+        # every linear layer, so dropping it silently corrupts outputs.
+        if layer.bias is not None:
+            self.register_buffer('bias', layer.bias.data.detach().clone())
+        else:
+            self.bias = None
+
         if original_shape is not None:
             self.original_weight_shape = original_shape
-        
+
         # Delete the original layer to free memory - we don't need it anymore
         del layer
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass using Pallas kernels if configured, otherwise XLA kernels."""
-        if self.config.use_pallas and self.pallas_kernel is not None:
-            # Use Pallas kernel
-            return self._forward_pallas(x)
-        else:
-            # Fallback to manual computation
-            return self._forward_manual(x)
-    
-    def _forward_pallas(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass using Pallas kernels."""
-        # Move tensors to XLA device if needed
-        if x.device.type != 'xla':
-            raise RuntimeError("Input must be on XLA device to use Pallas kernels")
-        
-        # Get optimal block sizes based on batch size
-        batch_size = x.shape[0]
-        batch_block_size, out_block_size, in_block_size = self._get_optimal_block_sizes(batch_size)
-        
-        # Reshape input to 2D if needed
-        original_shape = x.shape
-        if x.ndim > 2:
-            x = x.reshape(-1, x.shape[-1])
-        
-        # Unpack 4-bit weights if needed
+
+    def _unpacked_weight(self) -> torch.Tensor:
+        """Return the int8 weight, unpacking 4-bit packed values if needed."""
         q_weight = self.q_weight
         if self.config.pack_4bit and self.original_weight_shape is not None:
             q_weight = unpack_int8_to_int4(q_weight, self.original_weight_shape)
-        
-        # Call Pallas kernel with tuned block sizes
-        output = self.pallas_kernel(
-            x,
-            q_weight,
-            self.scale,
+        return q_weight
+
+    def _tuned_block_sizes(self, n_batch: int, n_out: int, n_in: int,
+                           x_dtype: torch.dtype) -> 'TunedValue':
+        """Look up tuned Pallas block sizes for this problem size."""
+        if not self.config.auto_tune_block_sizes:
+            return TunedValue(128, 128, 128)
+        x_q_dtype = 'int8' if self.config.quantize_activation else _torch_dtype_name(x_dtype)
+        return get_tuned_block_sizes(
+            n_batch=n_batch,
+            n_out=n_out,
+            n_in=n_in,
+            x_q_dtype=x_q_dtype,
+            w_q_dtype='int8',
         )
-        
-        # Reshape output back to original shape
-        if len(original_shape) > 2:
-            output = output.reshape(*original_shape[:-1], -1)
-        
+
+    def _get_pallas_kernel(self, tuned_value: 'TunedValue'):
+        """Build (or fetch from cache) the torch wrapper around the Pallas kernel.
+
+        The traced function must contain only the pl.pallas_call —
+        make_kernel_from_pallas extracts a single custom call from the traced
+        module — so all padding/abs-max/scale preprocessing happens in torch
+        inside `_forward_pallas` and the statics (x_q_dtype, block sizes) are
+        bound with functools.partial before tracing.
+        """
+        kernel = self._pallas_kernels.get(tuned_value)
+        if kernel is None:
+            x_q_dtype = jnp.int8 if self.config.quantize_activation else None
+            kernel_fn = functools.partial(
+                quantized_matmul_pallas_call,
+                x_q_dtype=x_q_dtype,
+                tuned_value=tuned_value,
+            )
+
+            def output_shape_fn(x, w_q, w_scale, x_abs_max):
+                return [((x.shape[0], w_q.shape[0]), x.dtype)]
+
+            kernel = make_kernel_from_pallas(kernel_fn, output_shape_fn)
+            self._pallas_kernels[tuned_value] = kernel
+        return kernel
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using Pallas kernels if configured, otherwise XLA kernels."""
+        if self.use_pallas and x.device.type == 'xla':
+            return self._forward_pallas(x)
+        else:
+            # Fallback to XLA fused kernel / manual computation
+            return self._forward_manual(x)
+
+    def _forward_pallas(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass using the Pallas quantized matmul kernel."""
+        original_shape = x.shape
+        if x.ndim != 2:
+            x2d = x.reshape(-1, original_shape[-1])
+        else:
+            x2d = x
+
+        q_weight = self._unpacked_weight()
+
+        n_batch, n_in = x2d.shape
+        n_out = q_weight.shape[0]
+
+        tuned_value = self._tuned_block_sizes(n_batch, n_out, n_in, x.dtype)
+
+        # The kernel requires every dimension to be a multiple of its block
+        # size; pad here (in torch, so it stays in the XLA graph) and slice
+        # the padding back off below.
+        pad_batch = next_multiple(n_batch, tuned_value.batch_block_size) - n_batch
+        pad_out = next_multiple(n_out, tuned_value.out_block_size) - n_out
+        pad_in = next_multiple(n_in, tuned_value.in_block_size) - n_in
+
+        # Per-row abs max must be computed outside the kernel (each grid step
+        # only sees one block of x). Clamp so padded/all-zero rows do not
+        # divide by zero inside the kernel.
+        x_abs_max = x2d.abs().amax(dim=-1).to(torch.float32)
+
+        if pad_batch or pad_in:
+            x2d = F.pad(x2d, (0, pad_in, 0, pad_batch))
+        if pad_batch:
+            x_abs_max = F.pad(x_abs_max, (0, pad_batch))
+        x_abs_max = x_abs_max.clamp(min=1e-8).reshape(1, -1)
+
+        if pad_out or pad_in:
+            q_weight = F.pad(q_weight, (0, pad_in, 0, pad_out))
+
+        w_scale = self.scale.reshape(-1).to(torch.float32)
+        if pad_out:
+            w_scale = F.pad(w_scale, (0, pad_out))
+        w_scale = w_scale.reshape(1, -1)
+
+        kernel = self._get_pallas_kernel(tuned_value)
+        output = kernel(x2d, q_weight, w_scale, x_abs_max)
+
+        # Slice off padding and restore the original leading dimensions.
+        output = output[:n_batch, :n_out]
+        if self.bias is not None:
+            output = output + self.bias
+        if len(original_shape) != 2:
+            output = output.reshape(*original_shape[:-1], n_out)
+
         return output
 
     def _forward_manual(self, x: torch.Tensor) -> torch.Tensor:
-        """Manual forward pass for fallback."""
-        # Unpack 4-bit weights if needed
-        q_weight = self.q_weight
-        if self.config.pack_4bit and self.original_weight_shape is not None:
-            q_weight = unpack_int8_to_int4(q_weight, self.original_weight_shape)
-        
+        """Forward pass via torch_xla's fused XLA kernel or eager dequant matmul."""
+        q_weight = self._unpacked_weight()
+
         if self.config.block_size == -1:
-            # Per-channel quantization
-            w = q_weight
-            if self.config.quantize_activation:
-                x_quant, x_scale = _quantize_tensor(x)
-                x_quant = x_quant.to(torch.int32)
-                w = w.to(torch.int32)
-                out = torch.nn.functional.linear(x_quant, w)
-                out = out.to(x.dtype) * self.scale * x_scale
-            else:
-                out = torch.nn.functional.linear(x, w.to(x.dtype))
-                out = out * self.scale
-            
-            if self.zero_point is not None:
-                zp_correction = torch.sum(x, dim=-1, keepdim=True) * self.zero_point
-                out = out - zp_correction
+            out = None
+            # Per-channel: prefer torch_xla's fused quantized matmul kernel.
+            if (self.config.use_xla_kernel and XLA_AVAILABLE
+                    and self.zero_point is None and x.device.type == 'xla'
+                    and not QuantizedLinear._xla_kernel_failed):
+                try:
+                    out = torch.ops.xla.quantized_matmul(
+                        x, q_weight, self.scale.to(x.dtype),
+                        quantize_activation=self.config.quantize_activation)
+                except Exception as exc:  # schema drift across torch_xla versions
+                    QuantizedLinear._xla_kernel_failed = True
+                    logger.warning(
+                        "torch.ops.xla.quantized_matmul unavailable (%s); "
+                        "falling back to eager dequant matmul.", exc)
+                    out = None
+            if out is None:
+                if self.config.quantize_activation:
+                    x_quant, x_scale = _quantize_tensor(x)
+                    out = torch.nn.functional.linear(
+                        x_quant.to(torch.int32), q_weight.to(torch.int32))
+                    out = out.to(x.dtype) * self.scale.to(x.dtype) * x_scale.to(x.dtype)
+                else:
+                    out = torch.nn.functional.linear(x, q_weight.to(x.dtype))
+                    out = out * self.scale.to(x.dtype)
+
+                if self.zero_point is not None:
+                    # w ~= (q - zp) * scale, so the correction term is
+                    # sum_j(x_j) * zp * scale per output channel.
+                    zp = self.zero_point.to(x.dtype) * self.scale.to(x.dtype)
+                    out = out - torch.sum(x, dim=-1, keepdim=True) * zp
         else:
-            # Blockwise quantization
+            # Blockwise quantization: q_weight is [num_blocks, block_size, out].
             x_reshaped = x.reshape(*x.shape[:-1], x.shape[-1] // self.config.block_size, self.config.block_size)
             w = q_weight.to(x.dtype)
             out = torch.einsum('scn,...sc->...sn', w, x_reshaped)
-            out = torch.einsum('sn,...sn->...n', self.scale, out)
-            
+            out = torch.einsum('sn,...sn->...n', self.scale.to(x.dtype), out)
+
             if self.zero_point is not None:
-                zp_out = x_reshaped.sum(dim=-1)
-                zp_out = torch.matmul(zp_out, self.zero_point)
-                out = out - zp_out
-        
+                zp_out = x_reshaped.sum(dim=-1)  # [..., num_blocks]
+                zp = self.zero_point.to(x.dtype) * self.scale.to(x.dtype)  # [num_blocks, out]
+                out = out - torch.einsum('sn,...s->...n', zp, zp_out)
+
+        if self.bias is not None:
+            out = out + self.bias
+
         return out
 
 
@@ -576,15 +665,21 @@ class LanguageModelQuantizer:
     
     def _should_quantize_layer(self, layer_name: str) -> bool:
         """Determine if a layer should be quantized based on its name."""
+        lname = layer_name.lower()
+
+        # User-configured exclusions always win
+        for pattern in self.config.exclude_layers:
+            if pattern.lower() in lname:
+                return False
+
         # Skip embedding layers unless configured
-        if 'embed' in layer_name.lower() and not self.config.quantize_embeddings:
+        if 'embed' in lname and not self.config.quantize_embeddings:
             return False
-        
-        # Skip LM head unless configured
-        if ('lm_head' in layer_name.lower() or 
-            'output' in layer_name.lower()) and not self.config.quantize_lm_head:
+
+        # Skip LM head / output heads unless configured
+        if ('lm_head' in lname or 'output' in lname) and not self.config.quantize_lm_head:
             return False
-        
+
         return True
     
     @staticmethod
@@ -611,6 +706,12 @@ class LanguageModelQuantizer:
             'buffer_size_mb': buffer_size / 1024 / 1024,
             'total_size_mb': total_size / 1024 / 1024
         }
+
+
+# The quantizer is architecture-agnostic (it replaces nn.Linear modules by
+# name), so it works for vision/segmentation models as well as language
+# models. `ModelQuantizer` is the preferred, neutral name.
+ModelQuantizer = LanguageModelQuantizer
 
 
 # Utility functions for common use cases
