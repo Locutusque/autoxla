@@ -29,7 +29,14 @@ It extends the Hugging Face Transformers interface with TPU-aware features like 
   * More to come in future versions
 
 * **Quantization Support**
-  Integrates with `LanguageModelQuantizer` via `QuantizationConfig` for parameter quantization before distribution.
+  Integrates with `ModelQuantizer` (alias `LanguageModelQuantizer`) via `QuantizationConfig` for parameter quantization before distribution. Three quantized-matmul backends are wired, in order of preference:
+
+  * A Pallas TPU kernel (per-channel symmetric int8/int4, optional dynamic activation quantization)
+  * torch_xla's fused `torch.ops.xla.quantized_matmul` kernel
+  * A pure-torch dequantize+matmul fallback (also covers blockwise and asymmetric quantization)
+
+* **Image Segmentation Models**
+  `AutoXLAModelForImageSegmentation` loads Hugging Face segmentation checkpoints (SAM/SAM2/SAM3, Mask2Former, SegFormer, ...) with vision-aware sharding, and `from_model` applies the same quantize/shard/wrap pipeline to natively built models (e.g. [MedSAM3](https://github.com/Locutusque/MedSAM3)'s SAM3).
 
 * **Flexible FSDP Wrapping**
   Integrates with `torch_xla.experimental.SpmdFullyShardedDataParallel` (`FSDPv2`) for efficient parameter and activation partitioning.
@@ -130,6 +137,54 @@ model = AutoXLAModelForCausalLM.from_pretrained(
 
 ---
 
+## Image Segmentation Models
+
+`AutoXLAModelForImageSegmentation` brings the same automatic sharding and quantization to segmentation models. Checkpoints are resolved against the segmentation auto classes in priority order: mask generation (SAM/SAM2/SAM3), universal segmentation (Mask2Former/OneFormer), instance segmentation, and semantic segmentation (SegFormer/UperNet).
+
+```python
+from AutoXLA import AutoXLAModelForImageSegmentation
+from AutoXLA.quantization import QuantizationConfig
+
+model = AutoXLAModelForImageSegmentation.from_pretrained(
+    "facebook/sam3",
+    sharding_strategy="fsdp",
+    do_quant=True,
+    quantization_config=QuantizationConfig(n_bits=8, use_pallas=True),
+)
+```
+
+**Wrapping a natively built model (e.g. MedSAM3):**
+
+Projects such as [MedSAM3](https://github.com/Locutusque/MedSAM3) build SAM3 through the native `sam3` package instead of `transformers`. Use `from_model` to apply AutoXLA's quantize → shard → FSDPv2 pipeline to any already-instantiated `nn.Module`:
+
+```python
+from sam3.model_builder import build_sam3_image_model
+from AutoXLA import AutoXLAModelForImageSegmentation
+from AutoXLA.quantization import QuantizationConfig
+
+model = build_sam3_image_model(load_from_HF=True, eval_mode=False)
+
+model = AutoXLAModelForImageSegmentation.from_model(
+    model,
+    sharding_strategy="fsdp",
+    do_quant=True,
+    quantization_config=QuantizationConfig(
+        n_bits=8,
+        use_pallas=True,
+        # keep accuracy-sensitive heads in full precision
+        exclude_layers=["iou_prediction_head", "output_upscaling"],
+    ),
+)
+```
+
+Notes for segmentation models:
+
+* Layer biases are preserved in full precision by quantization (SAM/ViT linears all carry biases).
+* Partition specs understand vision naming conventions (fused `qkv`, `proj`/`out_proj`, `fc1`/`fc2`, `lin1`/`lin2`, DETR's `linear1`/`linear2`) and conv kernels; tensors whose dimensions don't divide the mesh (e.g. relative position embeddings) are replicated automatically.
+* `attn_implementation` other than `"eager"` is ignored for segmentation models — the splash/flash kernels implement causal decoder attention, which is incorrect for bidirectional vision attention.
+
+---
+
 ## API Reference
 
 ### `AutoXLAModelForCausalLM`
@@ -155,6 +210,28 @@ Load a pretrained model with XLA-specific optimizations.
 
 **Returns:**
 A fully-loaded, sharded, and optionally quantized model ready for TPU execution.
+
+### `AutoXLAModelForImageSegmentation`
+
+A TPU-optimized loader/wrapper for image segmentation models (also exported as `AutoXLAModelForMaskGeneration`).
+
+#### **Class Methods**
+
+##### `from_pretrained(pretrained_model_name_or_path, **kwargs)`
+
+Load a Hugging Face segmentation checkpoint (e.g. `facebook/sam3`, `facebook/sam2-hiera-large`, `facebook/sam-vit-huge`, `nvidia/segformer-b0-finetuned-ade-512-512`) with automatic sharding and optional quantization. Accepts the same sharding/quantization arguments as `AutoXLAModelForCausalLM.from_pretrained`.
+
+##### `from_model(model, **kwargs)`
+
+Apply the quantize → shard → FSDPv2 pipeline to an already-instantiated `nn.Module` — the integration point for natively built models such as MedSAM3's SAM3.
+
+**Key Arguments (both methods):**
+
+* `sharding_strategy` (`str`) — One of `"fsdp"`, `"dp"`, `"mp"`, `"2d"`, `"3d"`
+* `do_quant` (`bool`) — Enable quantization
+* `quantization_config` — Instance of `QuantizationConfig`
+* `use_fsdp_wrap` (`bool`) — Whether to wrap with `FSDPv2` after sharding
+* `xla_patch_linear` (`bool`) — Apply torch_xla's einsum-based `nn.Linear` patch
 
 ---
 

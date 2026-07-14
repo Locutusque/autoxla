@@ -161,22 +161,24 @@ class AutoXLAModelForCausalLM(object):
         """
         Determine partition spec based on tensor name, shape, and strategy.
         """
+        # Note: partition spec entries must be mesh axis names. The meshes
+        # created by _create_mesh define the axes 'fsdp', 'model' and 'data'.
         if strategy.lower() == "fsdp":
             # FSDP: shard first dimension on fsdp axis
-            if 'embed_tokens' in name or 'lm_head' in name:
-                return ('fsdp', "mp")
+            if len(shape) > 2:
+                return ('fsdp',) + (None,) * (len(shape) - 1)
+            elif 'embed_tokens' in name or 'lm_head' in name:
+                return ('fsdp', 'model')
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
-                return ('fsdp', "mp")
+                return ('fsdp', 'model')
             elif 'o_proj' in name:
-                return ("mp", 'fsdp')
+                return ('model', 'fsdp')
             elif 'gate_proj' in name or 'up_proj' in name:
-                return ("mp", 'fsdp')
+                return ('model', 'fsdp')
             elif 'down_proj' in name:
-                return ('fsdp', "mp")
-            elif len(shape) > 2:
-                return ('fsdp', 'mp', None, None)
+                return ('fsdp', 'model')
             else:
-                return ('fsdp', "mp")
+                return ('fsdp', 'model')
                 
         elif strategy.lower() in ["dp", "data_parallel"]:
             # Data parallel: replicate all parameters
@@ -184,7 +186,9 @@ class AutoXLAModelForCausalLM(object):
             
         elif strategy.lower() in ["mp", "model_parallel"]:
             # Model parallel: shard on model axis
-            if 'embed_tokens' in name or 'lm_head' in name:
+            if len(shape) > 2:
+                return ('model',) + (None,) * (len(shape) - 1)
+            elif 'embed_tokens' in name or 'lm_head' in name:
                 return ('model', None)
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
                 return (None, 'model')
@@ -196,10 +200,12 @@ class AutoXLAModelForCausalLM(object):
                 return (None, 'model')
             else:
                 return (None, 'model')
-                
+
         elif strategy.lower() == "2d":
             # 2D sharding: use both fsdp and model axes
-            if 'embed_tokens' in name:
+            if len(shape) > 2:
+                return ('fsdp',) + (None,) * (len(shape) - 1)
+            elif 'embed_tokens' in name:
                 return ('model', 'fsdp')
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
                 return ('fsdp', 'model')
@@ -213,24 +219,28 @@ class AutoXLAModelForCausalLM(object):
                 return ('model', 'fsdp')
             else:
                 return ('fsdp', 'model')
-                
+
         elif strategy.lower() == "3d":
-            # 3D sharding: use data, fsdp, and model axes
-            # Typically replicate on data axis, shard on fsdp and model
-            if 'embed_tokens' in name:
-                return (None, 'model', 'fsdp')
+            # 3D sharding: parameters are sharded across the fsdp and model
+            # axes and replicated on the data axis. The partition spec must
+            # have the same rank as the tensor, so 2D weights get 2-element
+            # specs (the data axis only appears in activation/output specs).
+            if len(shape) > 2:
+                return ('fsdp',) + (None,) * (len(shape) - 1)
+            elif 'embed_tokens' in name:
+                return ('model', 'fsdp')
             elif 'q_proj' in name or 'k_proj' in name or 'v_proj' in name:
-                return (None, 'fsdp', 'model')
+                return ('fsdp', 'model')
             elif 'o_proj' in name:
-                return (None, 'model', 'fsdp')
+                return ('model', 'fsdp')
             elif 'gate_proj' in name or 'up_proj' in name:
-                return (None, 'model', 'fsdp')
+                return ('model', 'fsdp')
             elif 'down_proj' in name:
-                return (None, 'fsdp', 'model')
+                return ('fsdp', 'model')
             elif 'lm_head' in name:
-                return (None, 'model', 'fsdp')
+                return ('model', 'fsdp')
             else:
-                return (None, 'fsdp', 'model')
+                return ('fsdp', 'model')
         else:
             return None
 
