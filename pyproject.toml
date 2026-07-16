@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools==75.3.2", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -34,15 +34,26 @@ dependencies = [
     "tensorflow-cpu",
 ]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["AutoXLA*"]
-
-[tool.setuptools.package-data]
-AutoXLA = [
-    "kernels/*",
-    "optim/*",
-    "models/*",
-    "quantization/*",
-
+# The repository uses a flat-root layout: the repo root itself is the top-level
+# `AutoXLA` package (root __init__.py + utils.py), with subpackages under
+# kernels/, models/, optim/, quantization/. Map the import name to the repo
+# root and list every subpackage explicitly so that installing from source
+# (`pip install .`, `pip install -e .`, or `pip install git+<url>`) produces an
+# importable `AutoXLA` package. Automatic discovery cannot handle this layout:
+# `find_packages` skips the root package and cannot descend into kernels/.
+[tool.setuptools]
+packages = [
+    "AutoXLA",
+    "AutoXLA.kernels",
+    "AutoXLA.kernels.attention",
+    "AutoXLA.kernels.attention.flash_attention",
+    "AutoXLA.kernels.attention.splash_attention",
+    "AutoXLA.kernels.attention.splash_attention.models",
+    "AutoXLA.kernels.quantization",
+    "AutoXLA.models",
+    "AutoXLA.optim",
+    "AutoXLA.quantization",
 ]
+
+[tool.setuptools.package-dir]
+"AutoXLA" = "."
